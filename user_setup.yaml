@@ -1,0 +1,23 @@
+---
+- name: Setting up remote user on managed nodes
+  remote_user: root
+  become: true
+  hosts: all
+  tasks:
+    - name: creating new user on managed nodes
+      user:
+        name: <USER>
+        generate_ssh_key: yes
+        ssh_key_bits: 2048
+        ssh_key_file: .ssh/id_rsa
+        shell: /bin/bash
+    - name: copying public key from this project directory to remote users
+      authorized_key:
+        user: <USER>
+        state: present
+        key: "{{ lookup('file', './id_rsa.pub') }}"
+    - name: creating sudoers snapin file for this new user
+      copy:
+        content: "<USER> ALL=(ALL) NOPASSWD: ALL"
+        dest: /etc/sudoers.d/<USER>
+        validate: /usr/sbin/visudo -csf %s
