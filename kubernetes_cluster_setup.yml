@@ -1,0 +1,198 @@
+---
+- name: SETTING UP SYSTEM PREREQUISITES ON CONTROL AND WORKER NODES
+  hosts: all
+  tasks:
+    - name: disable current swap load on the worker nodes
+      shell:
+        cmd: "swapoff -a"
+    - name: permanently disable swap upon reboot
+      shell:
+        cmd: "sed -i '/ swap / s/^/#/' /etc/fstab"
+    - name: Editing the newly created snap-in file
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: checking worker nodes RAM
+      fail:
+        msg: The worker node has less than 2 GBs of total memory, k8s requires a minimum of 2GBs
+      when: ansible_facts.memory_mb.real.total < 1500
+    - name: Checking CPU cores on worker nodes
+      fail:
+        msg: "The worker node CPU has less than 2 cores, k8s requires a minimum of 2 cores"
+      when: ansible_facts.processor_vcpus < 1
+    - name: Checking shell UID
+      fail:
+        msg: "User is NOT root"
+      when: ansible_facts.real_user_id != 0
+    - name: loading kernel modules from snap-in file
+      shell:
+        cmd: "modprobe overlay ; modprobe br_netfilter"
+    - name: creating kernel parameter snap-in file
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    - name: loading the kernel parameters from the snap-in files
+      shell:
+        cmd: "sysctl --system"
+    - name: Disabling SELinux
+      shell:
+        cmd: "setenforce 0"
+    - name: Permanently disabling SELinux
+      shell:
+        cmd: "sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config"
+    - name: DISABLING SYSTEMD FIREWALLD SERVICE
+      systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
+
+- name: SETTING UP CONTAINER RELATED UTILITIES ON CONTROL AND WORKER NODES
+  hosts: all
+  tasks:
+  - name: Adding official Docker repository
+    shell:
+      cmd: "dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+  - name: Installing containerd
+    yum:
+      name: containerd
+      state: present
+  - name: creating default containerd config file
+    shell:
+      cmd: "containerd config default | tee /etc/containerd/config.toml"
+  - name: Enabling systemd CGroup
+    shell:
+      cmd: "sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml"
+  - name: Starting and enabling containerd
+    systemd:
+      name: containerd
+      state: started
+      enabled: true
+  - name: verifying the status of containerd
+    shell:
+      cmd: "systemctl status containerd"
+    register: containerd_status
+  - debug:
+      var: containerd_status.stdout
+
+  - name: Adding Kubernetes repository
+    copy:
+      dest: /etc/yum.repos.d/kubernetes.repo
+      content: |
+        [kubernetes]
+        name=Kubernetes
+        baseurl=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
+        enabled=1
+        gpgcheck=1
+        gpgkey=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
+
+  - name: Installing kubeadm kubelet and kubectl
+    yum:
+      name:
+      - kubeadm
+      - kubelet
+      - kubectl
+  - name: Starting and enabling kubelet
+    systemd:
+      name: kubelet
+      state: started
+      enabled: true
+
+
+# THE FOLLOWING PLAY IS FOR THE CONTROL PLANE NODE ONLY
+- name: INITIALIZING THE CONTROL PLANE
+  hosts: localhost
+  tasks:
+  - name: initialize with Pod CIDR for Flannel
+    shell:
+      cmd: "kubeadm init --pod-network-cidr=10.244.0.0/16"
+  - name: setting up the kube config file
+    shell:
+      cmd: "mkdir -p $HOME/.kube"
+  - name: copying conf file
+    shell:
+      cmd: "cp /etc/kubernetes/admin.conf $HOME/.kube/config"
+  - name: changing ownership of kube config file
+    shell:
+      cmd: "chown $(id -u):$(id -g) $HOME/.kube/config"
+  - name: VERIFYING THE API SERVER IS UP
+    shell:
+      cmd: "kubectl get nodes"
+    register: kubectl_output
+  - debug:
+      var: kubectl_output.stdout
+# EXPECTED SIMILAR OUTPUT
+
+# NAME     STATUS     ROLES           AGE   VERSION
+# master   NotReady   control-plane   30s   v1.31.x
+
+# END OF CONTROLLER NODE INITIALIZATION
+
+- name: INSTALLING A CNI PLUGIN ON THE CONTROLLER NODE
+  hosts: localhost
+  tasks:
+    - name: Installing Flannel
+      shell:
+        cmd: "kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+    - name: re-running get nodes
+      shell:
+        cmd: "kubectl get nodes"
+      register: kubectl_output_2
+    - debug:
+        var: kubectl_output_2.stdout
+    - name: joining the worker nodes
+      shell:
+        cmd: "kubeadm token create --print-join-command"
+      register: kube_token
+    - debug:
+        var: kube_token.stdout
+
+
+# REPLACE THE IP ADDRESS, TOKEN, AND HASH VALUES BELOW
+- name: JOINING WORKER NODES TO THE KUBERNETES CLUSTER
+  hosts: all
+  tasks:
+  - shell:
+      cmd: "kubeadm join <CONTROL_NODE_IP>:6443 --token <TOKEN> --discovery-token-ca-cert-hash sha256:<HASH>"
+# If any worker node fails to join the cluster, run the command below to reset it
+# sudo kubeadm reset
+
+
+# VERIFY and POST-INSTALLATION FROM THE CONTROL PLANE NODE
+- name: VERIFYING FROM CONTROLLER NODE THAT KUBELETS HAVE JOINED THE CLUSTER
+  hosts: localhost
+  tasks:
+  - shell:
+      cmd: "kubectl get nodes"
+    register: final_pods
+  - debug:
+      var: final_pods.stdout
+  - name: Printing system pods that should be running
+    shell:
+      cmd: "kubectl get pods -n kube-system"
+    register: system_pods
+  - debug:
+      var: system_pods.stdout
+  - name: Deploying a test application
+    shell:
+      cmd: "kubectl create deployment nginx --image=nginx:alpine --replicas=3"
+  - shell:
+      cmd: "kubectl expose deployment nginx --port=80 --type=NodePort"
+  - shell:
+      cmd: "kubectl get svc nginx"
+    register: svc_nginx
+  - debug:
+      var: svc_nginx.stdout
+  - name: CLEANING UP TEST
+    shell:
+      cmd: "kubectl delete deployment nginx"
+  - shell:
+      cmd: "kubectl delete svc nginx"
+
+
